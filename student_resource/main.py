@@ -5,8 +5,8 @@ from src.data_loader import load_data_in_batches
 from src.embedder import Embedder
 from src.blocker import FaissBlocker
 
-# SET THIS TO FALSE WHEN YOU ARE READY FOR THE FULL OVERNIGHT RUN
-DEBUG = False # Set to True for debugging with a smaller dataset
+# Set this to True for a small smoke run.
+DEBUG = False
 DEBUG_ROWS = 10000
 
 def get_id_column(chunk):
@@ -21,54 +21,60 @@ def run_full_pipeline():
     print(f"Initializing Pipeline... (DEBUG MODE: {DEBUG})")
     embedder = Embedder()
     blocker = FaissBlocker(dimension=384)
-    
-    s2_ids = []
-    
-    # 1. Index Source 2
-    print("\n--- Indexing Source 2 ---")
-    s2_path = "dataset/train/train_source2.tsv"
-    
-    for chunk in load_data_in_batches(s2_path, chunk_size=5000):
-        combined_text = chunk['business_name'] + " " + chunk['business_address']
-        vectors = embedder.get_embeddings(combined_text.tolist())
-        
-        blocker.add_vectors(vectors)
-        s2_ids.extend(chunk[get_id_column(chunk)].tolist())
-        
-        if DEBUG and len(s2_ids) >= DEBUG_ROWS:
-            print(f"Debug limit reached for Source 2 ({DEBUG_ROWS} rows).")
-            break
-        
-    # 2. Search with Source 1
-    print("\n--- Searching & Saving Results ---")
-    s1_path = "dataset/train/train_source1.tsv"
+
+    target_ids = []
+
+    # Index both target sources from the test split used for submission.
+    print("\n--- Indexing Source 2 and Source 3 ---")
+    target_paths = [
+        "dataset/test/test_source2.tsv",
+        "dataset/test/test_source3.tsv",
+    ]
+    for target_path in target_paths:
+        target_count = 0
+        for chunk in load_data_in_batches(target_path, chunk_size=5000):
+            combined_text = chunk['business_name'] + " " + chunk['business_address']
+            vectors = embedder.get_embeddings(combined_text.tolist())
+
+            blocker.add_vectors(vectors)
+            target_ids.extend(chunk[get_id_column(chunk)].tolist())
+            target_count += len(chunk)
+
+            if DEBUG and target_count >= DEBUG_ROWS:
+                print(f"Debug limit reached for {target_path} ({DEBUG_ROWS} rows).")
+                break
+
+    # Search with Source 1 from the same test split.
+    s1_path = "dataset/test/test_source1.tsv"
     output_dir = "output"
     os.makedirs(output_dir, exist_ok=True)
     candidate_path = os.path.join(output_dir, "candidate_pairs.tsv")
     matching_path = os.path.join(output_dir, "matching_results.tsv")
-    
+
     candidate_ids_by_s1 = defaultdict(list)
     s1_count = 0
-    
+
+    print("\n--- Searching & Saving Results ---")
     for chunk in load_data_in_batches(s1_path, chunk_size=1000):
         combined_text = chunk['business_name'] + " " + chunk['business_address']
         vectors = embedder.get_embeddings(combined_text.tolist())
-        
+
         distances, indices = blocker.search(vectors, top_k=5)
-        
+
         for i, s1_id in enumerate(chunk[get_id_column(chunk)].tolist()):
+            candidate_ids_by_s1.setdefault(s1_id, [])
             for match_idx in indices[i]:
-                if match_idx < len(s2_ids): # Safety check
-                    s2_id = s2_ids[match_idx]
-                    if s2_id not in candidate_ids_by_s1[s1_id]:
-                        candidate_ids_by_s1[s1_id].append(s2_id)
-                    
+                if match_idx < len(target_ids):
+                    target_id = target_ids[match_idx]
+                    if target_id not in candidate_ids_by_s1[s1_id]:
+                        candidate_ids_by_s1[s1_id].append(target_id)
+
         s1_count += len(chunk)
         if DEBUG and s1_count >= DEBUG_ROWS:
             print(f"Debug limit reached for Source 1 ({DEBUG_ROWS} rows).")
             break
-                
-    # 3. Write to TSV
+
+    # Include S1 rows with no candidates as required by the submission format.
     output_rows = [
         {
             "source1_entity_id": s1_id,
